@@ -1,0 +1,189 @@
+from flask import Flask, request, jsonify, render_template, Response
+import cv2
+import torch
+import numpy as np
+import base64
+import io
+import os
+import time
+from PIL import Image
+from collections import Counter
+from flask_mysqldb import MySQL
+import MySQLdb.cursors
+import re
+
+
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+
+from resnet50 import ResNet50
+
+
+app = Flask(__name__)
+ 
+ 
+app.config['MYSQL_HOST'] = 'localhost'
+app.config['MYSQL_USER'] = 'root'
+app.config['MYSQL_PASSWORD'] = '12345'
+app.config['MYSQL_DB'] = 'mydatabase'
+
+mysql = MySQL(app)
+
+
+checkpoint = torch.load("./checkpoints/best-checkpoint-009.pth", map_location=torch.device('cpu'))
+ResNet50.load_state_dict(checkpoint["model_state_dict"])
+ResNet50.eval()
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((256, 768)),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                     std=[0.229, 0.224, 0.225])
+])
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+# @app.route('/index1')
+@app.route('/sign_up', methods=['GET', 'POST'])
+def sign_up():
+    msg = ''
+    if request.method == 'POST' and 'name' in request.form and 'password' in request.form and 'email' in request.form:
+        name = request.form['name']
+        password = request.form['password']
+        email = request.form['email']
+        print(name, password, email)
+        cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
+        cursor.execute(
+            'SELECT * FROM users WHERE name = % s', (name))
+        account = cursor.fetchone()
+        if account:
+            msg = 'Account already exists !'
+        elif not re.match(r'[^@]+@[^@]+\.[^@]+', email):
+            msg = 'Invalid email address !'
+        elif not re.match(r'[A-Za-z0-9]+', name):
+            msg = 'name must contain only characters and numbers !'
+        else:
+            cursor.execute('INSERT INTO users VALUES \
+            (%s, %s, %s,)',
+                           (name, password, email,))
+            mysql.connection.commit()
+            msg = 'You have successfully created  !'
+    elif request.method == 'POST':
+        msg = 'Please fill out the form !'
+
+
+    return render_template('index1.html', msg=msg)
+
+
+@app.route('/home')
+def home():
+    return render_template('home.html')
+
+
+@app.route('/prediction')
+def predict():
+    return render_template('prediction.html')
+
+
+@app.route('/predict_from_video', methods=['POST'])
+def predict_from_video():
+    file = request.files['file']
+    video_bytes = file.read()
+    video_path = "temp_video.webm"
+    with open(video_path, "wb") as f:
+        f.write(video_bytes)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return jsonify({"error": "Failed to open video file"}), 500
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Reported total frames in video: {total_frames}")
+
+    # Count frames manually and collect predictions
+    frame_count = 0
+    predictions = []
+    num_samples = 5
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_count += 1
+        
+        # Only process every nth frame to get approximately 5 samples
+        if frame_count % max(1, (total_frames // num_samples)) == 0:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb_frame)
+            emotion = predict_emotion(pil_img, ResNet50)
+            predictions.append(emotion)
+            print(f"Processed frame {frame_count}, predicted emotion: {emotion}")
+        
+        if len(predictions) >= num_samples:
+            break
+
+    cap.release()
+    os.remove(video_path)
+
+    print(f"Actually processed frames: {frame_count}")
+    print(f"Number of predictions made: {len(predictions)}")
+
+    if not predictions:
+        return jsonify({"error": "No frames were successfully processed"}), 500
+
+    # Calculate the mode (most common prediction)
+    pred_counts = Counter(predictions)
+    final_emotion = pred_counts.most_common(1)[0][0]
+    print("Final Predicted Emotion: ", final_emotion)
+    return jsonify({"pred_emotion": final_emotion})
+
+
+@app.route('/predict_from_image', methods=['POST'])
+def predict_from_image():
+    file = request.files['file']
+    img_bytes = file.read()
+
+    pil_image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+
+    emotion = predict_emotion(pil_image, ResNet50)
+    print("Predicted Emotion: ", emotion)
+    
+    return jsonify({"pred_emotion": emotion})
+
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def gen_frames():
+    cap = cv2.VideoCapture(0)
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+        else:
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame = buffer.tobytes()
+            yield (b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            
+
+def predict_emotion(image, model):
+    image = transform(image).unsqueeze(0)
+
+    with torch.no_grad():
+        output = model(image)
+        _, pred = torch.max(output, 1)
+    
+    emotions = ['Angry', 'Contempt', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad','Surprised']
+    return emotions[pred]
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
